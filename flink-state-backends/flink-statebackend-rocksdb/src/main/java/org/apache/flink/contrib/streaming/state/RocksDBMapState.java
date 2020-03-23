@@ -716,8 +716,8 @@ class RocksDBMapState<K, N, UK, UV>
 	}
 
 	/**
-	 * This is a variation of the cached iterator which has not memory caching, is closeable &
-	 * supports reverse iteration.
+	 * This is a variation of the base iterator which does not use im-memory cache of the entire
+	 * table, is closeable, supports range filtering & supports reverse iteration.
 	 *
 	 * @param <T> Type returned by iterator
 	 */

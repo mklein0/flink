@@ -32,7 +32,7 @@ import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.fs.CloseableRegistry;
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.apache.flink.runtime.execution.Environment;
-import org.apache.flink.runtime.operators.testutils.DummyEnvironment;
+import org.apache.flink.runtime.operators.testutils.MockEnvironment;
 import org.apache.flink.runtime.state.AbstractKeyedStateBackend;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.StateBackendMigrationTestBase;
@@ -43,8 +43,11 @@ import org.apache.flink.runtime.testutils.statemigration.TestType;
 import org.apache.flink.runtime.testutils.statemigration.TestType.V1TestTypeSerializer;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
+import org.apache.flink.util.IOUtils;
 
+import org.junit.After;
 import org.junit.Assert;
+import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -63,15 +66,28 @@ import java.util.Map.Entry;
 public class RocksDBMapStateIteratorTest {
 	@Rule public final TemporaryFolder tempFolder = new TemporaryFolder();
 
+	final boolean enableIncrementalCheckpointing = false;
+
 	// Store it because we need it for the cleanup test.
 	private String dbPath;
 
+	private MockEnvironment env;
+
 	public RocksDBMapStateIteratorTest() {}
+
+	@Before
+	public void before() {
+		env = MockEnvironment.builder().build();
+	}
+
+	@After
+	public void after() {
+		IOUtils.closeQuietly(env);
+	}
 
 	protected RocksDBStateBackend getStateBackend() throws IOException {
 		dbPath = tempFolder.newFolder().getAbsolutePath();
 		String checkpointPath = tempFolder.newFolder().toURI().toString();
-		final boolean enableIncrementalCheckpointing = false;
 		RocksDBStateBackend backend =
 			new RocksDBStateBackend(
 				new FsStateBackend(checkpointPath), enableIncrementalCheckpointing);
@@ -87,33 +103,37 @@ public class RocksDBMapStateIteratorTest {
 
 	private <K> AbstractKeyedStateBackend<K> createKeyedBackend(TypeSerializer<K> keySerializer)
 		throws Exception {
-		return this.createKeyedBackend(keySerializer, new DummyEnvironment());
+		return this.createKeyedBackend(keySerializer, env);
 	}
 
 	private <K> AbstractKeyedStateBackend<K> createKeyedBackend(
-		TypeSerializer<K> keySerializer, Environment env) throws Exception {
-		return this.createKeyedBackend(keySerializer, 10, new KeyGroupRange(0, 9), env);
+		TypeSerializer<K> keySerializer,
+		Environment env) throws Exception {
+		return createKeyedBackend(
+			keySerializer,
+			10,
+			new KeyGroupRange(0, 9),
+			env);
 	}
 
 	private <K> AbstractKeyedStateBackend<K> createKeyedBackend(
 		TypeSerializer<K> keySerializer,
 		int numberOfKeyGroups,
 		KeyGroupRange keyGroupRange,
-		Environment env)
-		throws Exception {
-		return this.getStateBackend()
-			.createKeyedStateBackend(
-				env,
-				new JobID(),
-				"test_op",
-				keySerializer,
-				numberOfKeyGroups,
-				keyGroupRange,
-				env.getTaskKvStateRegistry(),
-				TtlTimeProvider.DEFAULT,
-				new UnregisteredMetricsGroup(),
-				Collections.emptyList(),
-				new CloseableRegistry());
+		Environment env) throws Exception {
+		AbstractKeyedStateBackend<K> backend = getStateBackend().createKeyedStateBackend(
+			env,
+			new JobID(),
+			"test_op",
+			keySerializer,
+			numberOfKeyGroups,
+			keyGroupRange,
+			env.getTaskKvStateRegistry(),
+			TtlTimeProvider.DEFAULT,
+			new UnregisteredMetricsGroup(),
+			Collections.emptyList(),
+			new CloseableRegistry());
+		return backend;
 	}
 
 	@Test

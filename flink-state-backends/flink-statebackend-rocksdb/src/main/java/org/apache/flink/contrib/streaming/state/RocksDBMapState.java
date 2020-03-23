@@ -31,13 +31,17 @@ import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
 import org.apache.flink.runtime.state.RegisteredKeyValueStateBackendMetaInfo;
 import org.apache.flink.runtime.state.StateSnapshotTransformer;
 import org.apache.flink.runtime.state.internal.InternalMapState;
+import org.apache.flink.util.CloseableIterable;
+import org.apache.flink.util.CloseableIterator;
 import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.StateMigrationException;
 
 import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
+import org.rocksdb.Slice;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -50,6 +54,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Objects;
 
 import static org.apache.flink.util.Preconditions.checkArgument;
 
@@ -706,6 +712,543 @@ class RocksDBMapState<K, N, UK, UV>
 			result[0] = NON_NULL_VALUE_PREFIX;
 			System.arraycopy(value, 0, result, 1, value.length);
 			return result;
+		}
+	}
+
+	/**
+	 * This is a variation of the cached iterator which has not memory caching, is closeable &
+	 * supports reverse iteration.
+	 *
+	 * @param <T> Type returned by iterator
+	 */
+	private abstract class RocksDBMapOnDiskIterator<T> implements CloseableIterator<T> {
+
+		/** The db where data resides. */
+		private final RocksDB db;
+
+		/**
+		 * The prefix bytes of the key being accessed. All entries under the same key have the same
+		 * prefix, hence we can stop iterating once coming across an entry with a different prefix.
+		 */
+		@Nonnull private final byte[] keyPrefixBytes;
+
+		/*
+		 * This is the pattern of the beginning of a the byte string key in ascending order
+		 */
+		@Nullable private final byte[] startBytes;
+
+		/**
+		 * The entry pointing to the current position which is last returned by calling {@link
+		 * #nextEntry()}.
+		 */
+		private RocksDBMapEntry nextEntry;
+
+		private final TypeSerializer<UK> keySerializer;
+		private final TypeSerializer<UV> valueSerializer;
+		private final DataInputDeserializer dataInputView;
+		private final RocksIteratorWrapper iterator;
+
+		RocksDBMapOnDiskIterator(
+			final RocksDB db,
+			final byte[] keyPrefixBytes,
+			final TypeSerializer<UK> keySerializer,
+			final TypeSerializer<UV> valueSerializer,
+			DataInputDeserializer dataInputView) {
+			this(db, keyPrefixBytes, keySerializer, valueSerializer, dataInputView, true, null, null);
+		}
+
+		RocksDBMapOnDiskIterator(
+			final RocksDB db,
+			final byte[] keyPrefixBytes,
+			final TypeSerializer<UK> keySerializer,
+			final TypeSerializer<UV> valueSerializer,
+			DataInputDeserializer dataInputView,
+			boolean forward,
+			@Nullable final byte[] keyLowerBoundBytes,
+			@Nullable final byte[] keyUpperBoundBytes) {
+
+			this.db = db;
+			this.keyPrefixBytes = keyPrefixBytes;
+			this.keySerializer = keySerializer;
+			this.valueSerializer = valueSerializer;
+			this.dataInputView = dataInputView;
+			this.startBytes = keyLowerBoundBytes == null ? keyPrefixBytes : keyLowerBoundBytes;
+
+			/*
+			 * In cached version, we check that keys match keyPrefixBytes:
+			 *
+			 *   if (!iterator.isValid() || !startWithKeyPrefix(keyPrefixBytes, iterator.key())) {
+			 *
+			 * since we use upper bounds, use that to limit where we iterate to.
+			 * UpperBound is an exclusive value.  lower <= X < upper (keyPrefixBytes + 1)
+			 */
+			byte[] upperBoundBytes = keyUpperBoundBytes;
+			if (keyUpperBoundBytes == null && keyPrefixBytes.length > 0) {
+				upperBoundBytes = incrementUpperBoundBytes(keyPrefixBytes);
+			}
+			this.iterator = setupIterator(forward, upperBoundBytes);
+		}
+
+		/*
+		 * Treat byte array similar to a big int array, perform addition and carry forward stripping
+		 * trailing null bytes.
+		 */
+		private byte[] incrementUpperBoundBytes(final byte[] source) {
+			// treat byte array as a BigDec number with carry over when adding 1 to it.
+			int lastBytePos = source.length - 1;
+			while (lastBytePos >= 0 && source[lastBytePos] == (byte) 0xFF) {
+				lastBytePos = lastBytePos - 1;
+			}
+
+			if (lastBytePos < 0) {
+				// Adding 1 removes the byte array from consideration.
+				return null;
+			}
+
+			byte[] destination = Arrays.copyOfRange(source, 0, lastBytePos + 1);
+			destination[lastBytePos] = (byte) (source[lastBytePos] + 1);
+
+			return destination;
+		}
+
+		@Override
+		public void close() throws Exception {
+			this.iterator.close();
+		}
+
+		@Override
+		public boolean hasNext() {
+			return nextEntry != null;
+		}
+
+		@Override
+		public void remove() {
+			throw new RuntimeException("Not Implemented");
+		}
+
+		private int compare(final byte[] a, final byte[] b) {
+			if (a == null && b == null) {
+				return 0;
+			}
+
+			if (a.length > b.length) {
+				// A longer than B
+				for (int i = 0; i < b.length; i++) {
+					int result = a[i] - b[i];
+					if (result < 0) {
+						return -1;
+					} else if (result > 0) {
+						return 1;
+					}
+				}
+
+				// A has more items than B
+				return 1;
+			}
+
+			// Else, a.length <= b.length
+			for (int i = 0; i < a.length; i++) {
+				int result = a[i] - b[i];
+				if (result < 0) {
+					return -1;
+				} else if (result > 0) {
+					return 1;
+				}
+			}
+
+			if (a.length < b.length) {
+				// B has more items than A
+				return -1;
+
+			} else {
+				return 0;
+			}
+		}
+
+		/*
+		 * Internal function to prime the iterator for a forward iteration.
+		 */
+		final void setupNextEntry(RocksIteratorWrapper iter) {
+			if (iter.isValid()) {
+				nextEntry =
+					new RocksDBMapEntry(
+						db,
+						keyPrefixBytes.length,
+						iter.key(),
+						iter.value(),
+						keySerializer,
+						valueSerializer,
+						dataInputView);
+
+			} else {
+				nextEntry = null;
+			}
+		}
+
+		/*
+		 * Internal function to move the iterator forward a step
+		 */
+		@Nonnull
+		final RocksDBMapEntry nextEntry() {
+			final RocksDBMapEntry currentEntry = nextEntry;
+			if (currentEntry == null) {
+				throw new IllegalStateException("Has no next value");
+			}
+
+			if (!iterator.isValid()) {
+				throw new IllegalStateException("Iterator in an invalid state");
+			}
+
+			iterator.next();
+			setupNextEntry(iterator);
+
+			return currentEntry;
+		}
+
+		/*
+		 * Internal function to prime the iterator for a reversed iteration.
+		 */
+		final void setupPrevEntry(RocksIteratorWrapper iter) {
+			if (iter.isValid() && compare(startBytes, iter.key()) <= 0) {
+				nextEntry =
+					new RocksDBMapEntry(
+						db,
+						keyPrefixBytes.length,
+						iter.key(),
+						iter.value(),
+						keySerializer,
+						valueSerializer,
+						dataInputView);
+
+			} else {
+				nextEntry = null;
+			}
+		}
+
+		/*
+		 * Internal function to move the iterator backwards a step
+		 */
+		@Nonnull
+		final RocksDBMapEntry prevEntry() {
+			final RocksDBMapEntry currentEntry = nextEntry;
+			if (currentEntry == null) {
+				throw new IllegalStateException("Has no next value");
+			}
+
+			iterator.prev();
+			setupPrevEntry(iterator);
+
+			return currentEntry;
+		}
+
+		/*
+		 * Internal function to prime the iterator for a forward or reversed iteration.
+		 */
+		private RocksIteratorWrapper setupIterator(
+			boolean forward, @Nullable final byte[] keyUpperBoundBytes) {
+
+			ReadOptions readOptions = new ReadOptions();
+			if (keyUpperBoundBytes != null) {
+				readOptions.setIterateUpperBound(new Slice(keyUpperBoundBytes));
+			}
+
+			RocksIteratorWrapper iter =
+				new RocksIteratorWrapper(db.newIterator(columnFamily, readOptions));
+			if (forward) {
+				/*
+				 * The iteration starts from the prefix bytes at the first loading. After #nextEntry() is called,
+				 * the currentEntry points to the last returned entry, and at that time, we will start
+				 * the iterating from currentEntry if reloading cache is needed.
+				 */
+				iter.seek(startBytes);
+				setupNextEntry(iter);
+
+			} else {
+				// iter.seekToLast is broken: https://github.com/facebook/rocksdb/issues/1034
+				// We found a workaround: https://github.com/facebook/rocksdb/wiki/SeekForPrev
+				iter.seekForPrev(keyUpperBoundBytes);
+				setupPrevEntry(iter);
+			}
+
+			return iter;
+		}
+	}
+
+	/*
+	 *
+	 */
+	static final class CloseableIteratorFactory<T> implements CloseableIterable<T> {
+		private final CloseableIterator<T> iterator;
+
+		CloseableIteratorFactory(CloseableIterator<T> iterator) {
+			this.iterator = Objects.requireNonNull(iterator);
+		}
+
+		@Override
+		public Iterator<T> iterator() {
+			return iterator;
+		}
+
+		@Override
+		public void close() throws IOException {
+			try {
+				iterator.close();
+
+			} catch (IOException e) {
+				throw e;
+
+			} catch (Exception e) {
+				// Should not happen, but wrap all exceptions in IOException
+				throw new IOException(e.getMessage(), e);
+			}
+		}
+	}
+
+	/**
+	 * Returns an Iterator which must be closed upon usage completion. This iterator starts at the
+	 * beginning of the Map and iterates to the end. The values are taken from disk as needed.
+	 *
+	 * @return A Closeable Iterator for the section of the rocksDB containing this Map
+	 */
+	public CloseableIterator<Entry<UK, UV>> forwardIterator() {
+		try {
+			return forwardIterator(null, null);
+
+		} catch (IOException e) {
+			// This should not happen as there are no bounds to process, but handle case anyway
+			throw new RuntimeException(e.getMessage(), e);
+		}
+	}
+
+	/**
+	 * Returns an Iterator which must be closed upon usage completion. This iterator starts at the end
+	 * of the Map and iterates down to the beginning. The values are taken from disk as needed.
+	 *
+	 * @return A Closeable Iterator for the section of the rocksDB containing this Map
+	 */
+	public CloseableIterator<Map.Entry<UK, UV>> reversedIterator() {
+		try {
+			return reversedIterator(null, null);
+
+		} catch (IOException e) {
+			// This should not happen as there are no bounds to process, but handle case anyway
+			throw new RuntimeException(e.getMessage(), e);
+		}
+	}
+
+	/**
+	 * Returns an Iterator which must be closed upon usage completion. This iterator starts at the
+	 * beginning of the Map, or the lower bound indicated and iterates until the end or the upper
+	 * bound indicated. The values are taken from disk as needed.
+	 *
+	 * @param lowerBound Inclusive User Key to start iteration at. If null starts from beginning of
+	 *     map
+	 * @param upperBound Exclusive User Key to stop iteration at. If null, iterates to the end of map
+	 */
+	public CloseableIterator<Entry<UK, UV>> forwardIterator(
+		@Nullable UK lowerBound, @Nullable UK upperBound) throws IOException {
+		final byte[] prefixBytes = serializeCurrentKeyWithGroupAndNamespace();
+
+		byte[] rawLowerKeyBytes;
+		if (lowerBound != null) {
+			rawLowerKeyBytes =
+				serializeCurrentKeyWithGroupAndNamespacePlusUserKey(lowerBound, userKeySerializer);
+		} else {
+			rawLowerKeyBytes = null;
+		}
+
+		byte[] rawUpperKeyBytes;
+		if (upperBound != null) {
+			rawUpperKeyBytes =
+				serializeCurrentKeyWithGroupAndNamespacePlusUserKey(upperBound, userKeySerializer);
+		} else {
+			rawUpperKeyBytes = null;
+		}
+
+		return new RocksDBMapOnDiskIterator<Entry<UK, UV>>(
+			backend.db,
+			prefixBytes,
+			userKeySerializer,
+			userValueSerializer,
+			dataInputView,
+			true,
+			rawLowerKeyBytes,
+			rawUpperKeyBytes) {
+			@Override
+			public Map.Entry<UK, UV> next() {
+				return nextEntry();
+			}
+		};
+	}
+
+	/**
+	 * Returns an Iterator which must be closed upon usage completion. This iterator starts at the end
+	 * of the Map or the upper bound indicated and iterates down to the beginning or lower bound
+	 * indicated. The values are taken from disk as needed.
+	 *
+	 * @param lowerBound Inclusive User Key to stop iteration at. If null starts from beginning of map
+	 * @param upperBound Exclusive User Key to start iteration at. If null, iterates to the end of map
+	 */
+	public CloseableIterator<Map.Entry<UK, UV>> reversedIterator(
+		@Nullable UK lowerBound, @Nullable UK upperBound) throws IOException {
+		final byte[] prefixBytes = serializeCurrentKeyWithGroupAndNamespace();
+
+		byte[] rawLowerKeyBytes;
+		if (lowerBound != null) {
+			rawLowerKeyBytes =
+				serializeCurrentKeyWithGroupAndNamespacePlusUserKey(lowerBound, userKeySerializer);
+		} else {
+			rawLowerKeyBytes = null;
+		}
+
+		byte[] rawUpperKeyBytes;
+		if (upperBound != null) {
+			rawUpperKeyBytes =
+				serializeCurrentKeyWithGroupAndNamespacePlusUserKey(upperBound, userKeySerializer);
+		} else {
+			rawUpperKeyBytes = null;
+		}
+
+		return new RocksDBMapOnDiskIterator<Entry<UK, UV>>(
+			backend.db,
+			prefixBytes,
+			userKeySerializer,
+			userValueSerializer,
+			dataInputView,
+			false,
+			rawLowerKeyBytes,
+			rawUpperKeyBytes) {
+			@Override
+			public Map.Entry<UK, UV> next() {
+				return prevEntry();
+			}
+		};
+	}
+
+	/**
+	 * This iterator starts at the end of the Map or the upper bound indicated and iterates down to
+	 * the beginning or lower bound indicated. The values are taken from disk as needed.
+	 *
+	 * @param lowerBound Inclusive User Key to start iteration at. If null starts from beginning of
+	 *     map
+	 * @param upperBound Exclusive User Key to stop iteration at. If null, iterates to the end of map
+	 * @return Returns an Iterator for the values of this map which must be closed upon usage
+	 *     completion
+	 * @throws IOException Thrown if user key bounds cannot be serialized
+	 */
+	public CloseableIterable<UK> forwardKeys(@Nullable UK lowerBound, @Nullable UK upperBound)
+		throws IOException {
+		final byte[] prefixBytes = serializeCurrentKeyWithGroupAndNamespace();
+
+		byte[] rawLowerKeyBytes;
+		if (lowerBound != null) {
+			rawLowerKeyBytes =
+				serializeCurrentKeyWithGroupAndNamespacePlusUserKey(lowerBound, userKeySerializer);
+		} else {
+			rawLowerKeyBytes = null;
+		}
+
+		byte[] rawUpperKeyBytes;
+		if (upperBound != null) {
+			rawUpperKeyBytes =
+				serializeCurrentKeyWithGroupAndNamespacePlusUserKey(upperBound, userKeySerializer);
+		} else {
+			rawUpperKeyBytes = null;
+		}
+
+		final RocksDBMapOnDiskIterator<UK> iterator =
+			new RocksDBMapOnDiskIterator<UK>(
+				backend.db,
+				prefixBytes,
+				userKeySerializer,
+				userValueSerializer,
+				dataInputView,
+				true,
+				rawLowerKeyBytes,
+				rawUpperKeyBytes) {
+				@Nullable
+				@Override
+				public UK next() {
+					RocksDBMapEntry entry = nextEntry();
+					return entry.getKey();
+				}
+			};
+
+		return new CloseableIteratorFactory<>(iterator);
+	}
+
+	/**
+	 * This iterator starts at the end of the Map or the upper bound indicated and iterates down to
+	 * the beginning or lower bound indicated. The values are taken from disk as needed.
+	 *
+	 * @param lowerBound Inclusive User Key to start iteration at. If null starts from beginning of
+	 *     map
+	 * @param upperBound Exclusive User Key to stop iteration at. If null, iterates to the end of map
+	 * @return Returns an Iterator for the values of this map which must be closed upon usage
+	 *     completion
+	 * @throws IOException Thrown if user key bounds cannot be serialized
+	 */
+	public CloseableIterable<UV> forwardValues(@Nullable UK lowerBound, @Nullable UK upperBound)
+		throws IOException {
+		final byte[] prefixBytes = serializeCurrentKeyWithGroupAndNamespace();
+
+		byte[] rawLowerKeyBytes;
+		if (lowerBound != null) {
+			rawLowerKeyBytes =
+				serializeCurrentKeyWithGroupAndNamespacePlusUserKey(lowerBound, userKeySerializer);
+		} else {
+			rawLowerKeyBytes = null;
+		}
+
+		byte[] rawUpperKeyBytes;
+		if (upperBound != null) {
+			rawUpperKeyBytes =
+				serializeCurrentKeyWithGroupAndNamespacePlusUserKey(upperBound, userKeySerializer);
+		} else {
+			rawUpperKeyBytes = null;
+		}
+
+		RocksDBMapOnDiskIterator<UV> iterator =
+			new RocksDBMapOnDiskIterator<UV>(
+				backend.db,
+				prefixBytes,
+				userKeySerializer,
+				userValueSerializer,
+				dataInputView,
+				true,
+				rawLowerKeyBytes,
+				rawUpperKeyBytes) {
+				@Override
+				public UV next() {
+					RocksDBMapEntry entry = nextEntry();
+					return entry.getValue();
+				}
+			};
+
+		return new CloseableIteratorFactory<>(iterator);
+	}
+
+	/**
+	 * This iterator starts at the end of the Map or the upper bound indicated and iterates down to
+	 * the beginning or lower bound indicated. The values are taken from disk as needed.
+	 *
+	 * @param lowerBound Inclusive User Key to start iteration at. If null starts from beginning of
+	 *     map
+	 * @param upperBound Exclusive User Key to stop iteration at. If null, iterates to the end of map
+	 * @return Returns an Iterator for the entries of this map which must be closed upon usage
+	 *     completion
+	 * @throws IOException Thrown if user key bounds cannot be serialized
+	 */
+	public CloseableIterable<Entry<UK, UV>> forwardEntries(
+		@Nullable UK lowerBound, @Nullable UK upperBound) throws IOException {
+		final CloseableIterator<Entry<UK, UV>> iterator = forwardIterator(lowerBound, upperBound);
+
+		// Return null to make the behavior consistent with other states.
+		if (!iterator.hasNext()) {
+			return null;
+
+		} else {
+			return new CloseableIteratorFactory<>(iterator);
 		}
 	}
 }
